@@ -1,7 +1,6 @@
 # SAM3 LoRA - Git Ignore
 
 # SAM3 official repository (users should clone separately)
-sam3/
 
 # Python
 __pycache__/
