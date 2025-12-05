@@ -186,15 +186,30 @@ class SAM3LoRAInference:
         pred_logits = outputs['pred_logits']  # [batch, num_queries, num_classes]
         pred_boxes = outputs['pred_boxes']    # [batch, num_queries, 4]
         pred_masks = outputs.get('pred_masks', None)  # [batch, num_queries, H, W]
+        presence_logit = outputs.get('presence_logit_dec', None)  # [batch, num_queries]
+
+        # Get confidence scores (sigmoid of logits)
+        out_probs = pred_logits.sigmoid()
+
+        # IMPORTANT: Multiply by presence score to filter out "no object" predictions
+        if presence_logit is not None:
+            presence_score = presence_logit.sigmoid().unsqueeze(-1)  # [batch, num_queries, 1]
+            out_probs = out_probs * presence_score
+            print(f"\n✅ Using presence scores to filter predictions")
 
         # Convert to numpy for easier handling
-        pred_logits = pred_logits.cpu().numpy()
+        scores = out_probs.cpu().numpy()
         pred_boxes = pred_boxes.cpu().numpy()
         if pred_masks is not None:
             pred_masks = pred_masks.cpu().numpy()
 
-        # Get confidence scores (sigmoid of logits)
-        scores = 1 / (1 + np.exp(-pred_logits))  # Sigmoid
+        # Debug: Print box value ranges
+        boxes_0 = pred_boxes[0]
+        print(f"\n📊 Box statistics:")
+        print(f"  cx range: [{boxes_0[:, 0].min():.3f}, {boxes_0[:, 0].max():.3f}]")
+        print(f"  cy range: [{boxes_0[:, 1].min():.3f}, {boxes_0[:, 1].max():.3f}]")
+        print(f"  w range: [{boxes_0[:, 2].min():.3f}, {boxes_0[:, 2].max():.3f}]")
+        print(f"  h range: [{boxes_0[:, 3].min():.3f}, {boxes_0[:, 3].max():.3f}]")
 
         return {
             'boxes': pred_boxes[0],  # Remove batch dimension
@@ -249,20 +264,26 @@ class SAM3LoRAInference:
 
         # Draw boxes and masks
         for idx in valid_indices:
-            box = boxes[idx]  # [x_center, y_center, width, height] normalized
+            box = boxes[idx]  # [cx, cy, w, h] normalized [0, 1]
             score = scores[idx].max()
 
-            # Convert from normalized coordinates
-            orig_w, orig_h = predictions['original_size']
-            x_center, y_center, width, height = box
-            x_center *= orig_w
-            y_center *= orig_h
-            width *= orig_w
-            height *= orig_h
+            # Convert from [cx, cy, w, h] to [x1, y1, x2, y2] (still normalized)
+            cx, cy, w, h = box
+            x1 = cx - w / 2
+            y1 = cy - h / 2
+            x2 = cx + w / 2
+            y2 = cy + h / 2
 
-            # Convert to corner format
-            x1 = x_center - width / 2
-            y1 = y_center - height / 2
+            # Scale to original image size
+            orig_w, orig_h = predictions['original_size']
+            x1 = x1 * orig_w
+            y1 = y1 * orig_h
+            x2 = x2 * orig_w
+            y2 = y2 * orig_h
+
+            # Get width and height for rectangle
+            width = x2 - x1
+            height = y2 - y1
 
             # Draw box
             rect = patches.Rectangle(
