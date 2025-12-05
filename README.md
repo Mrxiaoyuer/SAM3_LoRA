@@ -143,6 +143,36 @@ Then train with:
 python3 train_sam3_lora_native.py --config configs/quick_test_config.yaml
 ```
 
+### Inference
+
+Run inference with your trained LoRA model:
+
+```bash
+# Basic inference
+python3 inference_lora.py \
+  --config configs/full_lora_config.yaml \
+  --weights outputs/sam3_lora_full/lora_weights.pt \
+  --image path/to/test_image.jpg \
+  --output predictions.png
+
+# With custom text prompt
+python3 inference_lora.py \
+  --config configs/full_lora_config.yaml \
+  --weights outputs/sam3_lora_full/lora_weights.pt \
+  --image path/to/test_image.jpg \
+  --prompt "red car" \
+  --output predictions.png \
+  --threshold 0.7
+```
+
+**Parameters:**
+- `--config`: Same YAML config used for training
+- `--weights`: Path to saved LoRA weights (lora_weights.pt)
+- `--image`: Input image to segment
+- `--prompt`: Optional text prompt for specific objects
+- `--output`: Where to save visualization
+- `--threshold`: Confidence threshold (default: 0.5)
+
 ### Python API
 
 Use the trainer programmatically:
@@ -549,7 +579,37 @@ EOF
 python3 train_sam3_lora_native.py --config configs/production.yaml
 ```
 
-### Example 3: Apply LoRA to Your Own Model
+### Example 3: Run Inference on Trained Model
+
+```bash
+# After training completes, run inference on test images
+python3 inference_lora.py \
+  --config configs/full_lora_config.yaml \
+  --weights outputs/sam3_lora_full/lora_weights.pt \
+  --image data/test/sample.jpg \
+  --output predictions/sample_result.png \
+  --threshold 0.6
+```
+
+Or programmatically:
+
+```python
+from inference_lora import SAM3LoRAInference
+
+# Initialize inference
+inferencer = SAM3LoRAInference(
+    config_path="configs/full_lora_config.yaml",
+    weights_path="outputs/sam3_lora_full/lora_weights.pt"
+)
+
+# Run prediction
+predictions = inferencer.predict("path/to/image.jpg")
+
+# Visualize
+inferencer.visualize_predictions(predictions, "output.png", confidence_threshold=0.5)
+```
+
+### Example 4: Apply LoRA to Your Own Model
 
 ```python
 from lora_layers import LoRAConfig, apply_lora_to_model, count_parameters
@@ -620,6 +680,7 @@ sam3_lora/
 │
 ├── lora_layers.py                 # LoRA implementation
 ├── train_sam3_lora_native.py      # Main training script (CLI + YAML)
+├── inference_lora.py              # Inference script for trained models
 └── README.md                      # This file
 ```
 

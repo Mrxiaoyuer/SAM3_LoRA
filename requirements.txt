@@ -19,6 +19,7 @@ tqdm>=4.65.0
 
 # Visualization
 matplotlib>=3.7.0
+scipy>=1.10.0
 
 # Optional: Weights & Biases for experiment tracking
 # wandb>=0.15.0
