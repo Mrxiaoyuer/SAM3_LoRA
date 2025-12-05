@@ -15,6 +15,7 @@ from PIL import Image as PILImage
 # SAM3 Imports
 from sam3.model_builder import build_sam3_image_model
 from sam3.train.loss.loss_fns import IABCEMdetr, Boxes, Masks, CORE_LOSS_KEY
+from sam3.train.loss.sam3_loss import Sam3LossWrapper
 from sam3.train.matcher import BinaryHungarianMatcherV2
 from sam3.train.data.collator import collate_fn_api
 from sam3.train.data.sam3_image_dataset import Datapoint, Image, Object, FindQueryLoaded, InferenceMetadata
@@ -202,19 +203,44 @@ class SAM3TrainerNative:
         self.matcher = BinaryHungarianMatcherV2(
             cost_class=2.0, cost_bbox=5.0, cost_giou=2.0, focal=True
         )
-        
-        # Weights from a standard SAM config roughly
-        weight_dict = {
-            "loss_ce": 2.0,
-            "loss_bbox": 5.0,
-            "loss_giou": 2.0,
-            "loss_mask": 5.0,
-            "loss_dice": 5.0
-        }
-        
-        self.criterion_cls = IABCEMdetr(pos_weight=1.0, weight_dict=weight_dict, pos_focal=True)
-        self.criterion_box = Boxes(weight_dict=weight_dict)
-        self.criterion_mask = Masks(weight_dict=weight_dict)
+
+        # Create loss functions with correct weights (from original SAM3 training config)
+        # Note: These weights are for mask-based training
+        loss_fns = [
+            Boxes(weight_dict={
+                "loss_bbox": 5.0,
+                "loss_giou": 2.0
+            }),
+            IABCEMdetr(
+                pos_weight=10.0,
+                weight_dict={
+                    "loss_ce": 20.0,
+                    "presence_loss": 20.0
+                },
+                pos_focal=False,
+                alpha=0.25,
+                gamma=2,
+                use_presence=True,
+                pad_n_queries=200,
+            ),
+            Masks(
+                weight_dict={
+                    "loss_mask": 200.0,  # Much higher weight for mask loss!
+                    "loss_dice": 10.0
+                },
+                focal_alpha=0.25,
+                focal_gamma=2.0,
+                compute_aux=False
+            )
+        ]
+
+        # Use Sam3LossWrapper for proper loss computation
+        self.loss_wrapper = Sam3LossWrapper(
+            loss_fns_find=loss_fns,
+            matcher=self.matcher,
+            normalization="local",  # Use local normalization (no distributed training)
+            normalize_by_valid_object_num=False,
+        )
         
     def train(self):
         train_ds = SimpleSAM3Dataset("data", image_set="train")
@@ -304,61 +330,26 @@ class SAM3TrainerNative:
                 # Move to device
                 input_batch = move_to_device(input_batch, self.device)
                 
-                # Forward
-                # forward() expects BatchedDatapoint
-                # We need to make sure find_targets are on device?
-                # Sam3Image.forward constructs backbone_out.
-                
+                # Forward pass
+                # outputs_list is SAM3Output, we need to pass the whole thing to loss_wrapper
                 outputs_list = self.model(input_batch)
-                # outputs_list is SAM3Output with iter_mode=LAST_STEP_PER_STAGE
-                # So outputs_list[-1] returns the last step of the last stage, which is the output dict.
-                outputs = outputs_list[-1]
-                
+
                 # Prepare targets for loss
-                # input_batch.find_targets is a list of BatchedFindTarget
-                targets_raw = input_batch.find_targets[0] # Stage 0
-                targets = self.model.back_convert(targets_raw)
-                
+                # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
+                find_targets = [self.model.back_convert(target) for target in input_batch.find_targets]
+
                 # Move targets to device
-                for k, v in targets.items():
-                    if isinstance(v, torch.Tensor):
-                        targets[k] = v.to(self.device)
-                
-                # Compute Matcher Indices
-                # outputs has 'pred_logits', 'pred_boxes'
-                # targets has 'boxes', 'labels' etc.
+                for targets in find_targets:
+                    for k, v in targets.items():
+                        if isinstance(v, torch.Tensor):
+                            targets[k] = v.to(self.device)
 
-                # We need indices for loss
-                # The loss wrapper usually calls matcher.
-                # We do it manually here.
-                indices = self.matcher(outputs, targets)
+                # Compute loss using Sam3LossWrapper
+                # This handles matcher, num_boxes calculation, and proper weighting
+                loss_dict = self.loss_wrapper(outputs_list, find_targets)
 
-                # Calculate actual number of ground truth boxes for normalization
-                # targets['num_boxes'] contains count per image in batch, sum them up
-                if 'num_boxes' in targets and isinstance(targets['num_boxes'], torch.Tensor):
-                    num_boxes = targets['num_boxes'].sum().item()
-                elif 'boxes' in targets and targets['boxes'].numel() > 0:
-                    num_boxes = targets['boxes'].shape[0]
-                else:
-                    num_boxes = 1
-                num_boxes = max(num_boxes, 1)  # Avoid division by zero
-
-                # Compute Losses
-                losses = {}
-
-                l_cls = self.criterion_cls.get_loss(outputs, targets, indices, num_boxes=num_boxes)
-                l_box = self.criterion_box.get_loss(outputs, targets, indices, num_boxes=num_boxes)
-                l_mask = self.criterion_mask.get_loss(outputs, targets, indices, num_boxes=num_boxes)
-                
-                losses.update(l_cls)
-                losses.update(l_box)
-                losses.update(l_mask)
-                
-                # Reduce
-                total_loss = 0
-                for k, v in losses.items():
-                    if k in weight_dict:
-                        total_loss += v * weight_dict[k]
+                # Extract total loss
+                total_loss = loss_dict[CORE_LOSS_KEY]
                 
                 # Backward
                 self.optimizer.zero_grad()
@@ -378,44 +369,21 @@ class SAM3TrainerNative:
                         input_batch = batch_dict["input"]
                         input_batch = move_to_device(input_batch, self.device)
 
-                        # Forward
+                        # Forward pass
                         outputs_list = self.model(input_batch)
-                        outputs = outputs_list[-1]
 
                         # Prepare targets
-                        targets_raw = input_batch.find_targets[0]
-                        targets = self.model.back_convert(targets_raw)
+                        find_targets = [self.model.back_convert(target) for target in input_batch.find_targets]
 
-                        for k, v in targets.items():
-                            if isinstance(v, torch.Tensor):
-                                targets[k] = v.to(self.device)
+                        # Move targets to device
+                        for targets in find_targets:
+                            for k, v in targets.items():
+                                if isinstance(v, torch.Tensor):
+                                    targets[k] = v.to(self.device)
 
-                        # Compute losses
-                        indices = self.matcher(outputs, targets)
-                        losses = {}
-
-                        # Calculate actual number of ground truth boxes for normalization
-                        # targets['num_boxes'] contains count per image in batch, sum them up
-                        if 'num_boxes' in targets and isinstance(targets['num_boxes'], torch.Tensor):
-                            num_boxes = targets['num_boxes'].sum().item()
-                        elif 'boxes' in targets and targets['boxes'].numel() > 0:
-                            num_boxes = targets['boxes'].shape[0]
-                        else:
-                            num_boxes = 1
-                        num_boxes = max(num_boxes, 1)  # Avoid division by zero
-
-                        l_cls = self.criterion_cls.get_loss(outputs, targets, indices, num_boxes=num_boxes)
-                        l_box = self.criterion_box.get_loss(outputs, targets, indices, num_boxes=num_boxes)
-                        l_mask = self.criterion_mask.get_loss(outputs, targets, indices, num_boxes=num_boxes)
-
-                        losses.update(l_cls)
-                        losses.update(l_box)
-                        losses.update(l_mask)
-
-                        total_loss = 0
-                        for k, v in losses.items():
-                            if k in weight_dict:
-                                total_loss += v * weight_dict[k]
+                        # Compute loss using Sam3LossWrapper
+                        loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                        total_loss = loss_dict[CORE_LOSS_KEY]
 
                         val_losses.append(total_loss.item())
                         val_pbar.set_postfix({"val_loss": total_loss.item()})
