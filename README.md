@@ -352,12 +352,25 @@ During training, two models are automatically saved:
 ℹ️  No validation data - consider adding data/valid/ for better model selection
 ```
 
-### Full Evaluation After Training
+---
 
-**Important**: Training only computes validation loss (no metrics). After training completes, run the standalone evaluation script to get full metrics:
+## Validation
+
+### Overview
+
+SAM3-LoRA uses a **two-stage validation approach** following SAM3's original design:
+
+1. **During Training**: Only validation **loss** is computed (fast, no expensive metrics)
+2. **After Training**: Run full evaluation with mAP, cgF1 metrics and NMS filtering
+
+This approach **significantly speeds up training** while still monitoring overfitting via validation loss.
+
+### Quick Validation
+
+After training completes, evaluate your model:
 
 ```bash
-# Evaluate best model with full metrics (mAP, cgF1) and NMS
+# Basic validation (uses best model automatically)
 python3 validate_sam3_lora.py \
   --config configs/full_lora_config.yaml \
   --weights outputs/sam3_lora_full/best_lora_weights.pt \
@@ -372,16 +385,165 @@ python3 validate_sam3_lora.py \
   --split test
 ```
 
-**This will compute:**
-- COCO mAP metrics (IoU 0.50:0.95, 0.50, 0.75)
-- Category-agnostic F1 scores (cgF1, cgF1@50, cgF1@75)
-- Applies SAM3's NMS filtering (prob_threshold=0.3, iou_threshold=0.7)
-- Generates detailed predictions
+**Expected Output:**
+```
+Running SAM3 LoRA Validation
+Building SAM3 model...
+Loading LoRA weights from outputs/sam3_lora_full/best_lora_weights.pt
+Loaded COCO dataset: valid split
+  Images: 152
+  Annotations: 298
 
-**Why separate evaluation?**
-- ⚡ **Faster training**: No expensive metric computation during training
-- 📊 **Better monitoring**: Validation loss is sufficient to detect overfitting
-- 🎯 **Accurate metrics**: Full evaluation with proper NMS and post-processing
+Processing: 100%|████████| 152/152 [02:15<00:00]
+
+Validation Results:
+================================================================================
+  Total predictions: 946 (after NMS from 1353 initial detections)
+  Total ground truth: 298
+
+COCO Evaluation Metrics:
+--------------------------------------------------------------------------------
+  mAP (IoU 0.50:0.95): 0.245
+  mAP@50 (IoU 0.50):   0.287
+  mAP@75 (IoU 0.75):   0.198
+
+Category-agnostic F1 Scores:
+--------------------------------------------------------------------------------
+  cgF1 (avg):          0.135
+  cgF1@50:             0.149
+  cgF1@75:             0.089
+================================================================================
+```
+
+### Validation Metrics Explained
+
+| Metric | Description | Good Value | Excellent Value |
+|--------|-------------|------------|-----------------|
+| **mAP (0.50:0.95)** | Mean Average Precision across IoU thresholds 0.5 to 0.95 | > 0.30 | > 0.50 |
+| **mAP@50** | Precision at IoU threshold 0.50 (looser) | > 0.40 | > 0.70 |
+| **mAP@75** | Precision at IoU threshold 0.75 (stricter) | > 0.25 | > 0.45 |
+| **cgF1** | Concept-level F1 (SAM3's primary metric) | > 0.25 | > 0.50 |
+| **cgF1@50** | cgF1 at IoU 0.50 | > 0.30 | > 0.60 |
+| **cgF1@75** | cgF1 at IoU 0.75 | > 0.15 | > 0.35 |
+
+**Understanding the Metrics:**
+- **mAP**: Standard COCO metric - higher is better, penalizes over/under-segmentation
+- **cgF1**: SAM3's concept-level metric - balances precision and recall for concepts, not individual instances
+- **@50/@75**: Different IoU thresholds (50% overlap vs 75% overlap)
+
+### Advanced Validation Options
+
+**1. Adjust Confidence Threshold:**
+```bash
+# More conservative (fewer but higher confidence predictions)
+python3 validate_sam3_lora.py \
+  --config configs/full_lora_config.yaml \
+  --weights outputs/sam3_lora_full/best_lora_weights.pt \
+  --data_dir /workspace/data2 \
+  --split valid \
+  --prob-threshold 0.5
+
+# More permissive (more predictions, lower confidence)
+python3 validate_sam3_lora.py \
+  --config configs/full_lora_config.yaml \
+  --weights outputs/sam3_lora_full/best_lora_weights.pt \
+  --data_dir /workspace/data2 \
+  --split valid \
+  --prob-threshold 0.2
+```
+
+**2. Merge Overlapping Segments (for crack-like objects):**
+```bash
+# Enable merging to reduce over-segmentation
+python3 validate_sam3_lora.py \
+  --config configs/full_lora_config.yaml \
+  --weights outputs/sam3_lora_full/best_lora_weights.pt \
+  --data_dir /workspace/data2 \
+  --split valid \
+  --merge \
+  --merge-iou 0.15
+
+# Aggressive merging for highly fragmented objects
+python3 validate_sam3_lora.py \
+  --config configs/full_lora_config.yaml \
+  --weights outputs/sam3_lora_full/best_lora_weights.pt \
+  --data_dir /workspace/data2 \
+  --split valid \
+  --merge \
+  --merge-iou 0.05 \
+  --prob-threshold 0.5
+```
+
+**3. Adjust NMS Settings:**
+```bash
+# More aggressive NMS (fewer duplicate detections)
+python3 validate_sam3_lora.py \
+  --config configs/full_lora_config.yaml \
+  --weights outputs/sam3_lora_full/best_lora_weights.pt \
+  --data_dir /workspace/data2 \
+  --split valid \
+  --nms-iou 0.5
+
+# Less aggressive NMS (keep more overlapping segments)
+python3 validate_sam3_lora.py \
+  --config configs/full_lora_config.yaml \
+  --weights outputs/sam3_lora_full/best_lora_weights.pt \
+  --data_dir /workspace/data2 \
+  --split valid \
+  --nms-iou 0.8
+```
+
+### Validation Parameters Reference
+
+| Parameter | Default | Description | When to Adjust |
+|-----------|---------|-------------|----------------|
+| `--prob-threshold` | 0.3 | Minimum confidence score | Lower if missing objects (0.2), higher if too many false positives (0.5) |
+| `--nms-iou` | 0.7 | NMS IoU threshold | Lower for fewer duplicates (0.5), higher to keep overlaps (0.8) |
+| `--merge` | False | Enable segment merging | Use for crack-like or connected objects |
+| `--merge-iou` | 0.15 | IoU threshold for merging | Lower for aggressive merging (0.05), higher for conservative (0.25) |
+
+### Interpreting Results
+
+**Scenario 1: Too Many Predictions**
+```
+Total predictions: 1353
+Total ground truth: 298
+mAP@50: 0.29
+```
+**Solution**: Model is over-segmenting. Try:
+- Increase `--prob-threshold` to 0.4-0.5
+- Decrease `--nms-iou` to 0.5-0.6
+- Use `--merge` with `--merge-iou 0.15`
+
+**Scenario 2: Too Few Predictions**
+```
+Total predictions: 150
+Total ground truth: 298
+mAP@50: 0.15
+```
+**Solution**: Model is under-detecting. Try:
+- Decrease `--prob-threshold` to 0.2
+- Train longer or with higher LoRA rank
+
+**Scenario 3: Good Quantity, Poor Quality**
+```
+Total predictions: 310
+Total ground truth: 298
+mAP@50: 0.35 (low)
+cgF1@50: 0.25 (low)
+```
+**Solution**: Detections are inaccurate. Need better training:
+- Train for more epochs
+- Use `configs/full_lora_config.yaml` instead of light config
+- Check data quality
+
+### Why Separate Evaluation?
+
+**Benefits:**
+- ⚡ **10x Faster Training**: No expensive metric computation during training
+- 📊 **Better Monitoring**: Validation loss is sufficient to detect overfitting
+- 🎯 **Accurate Metrics**: Full evaluation with proper NMS and post-processing
+- 🔧 **Flexible Testing**: Try different thresholds without retraining
 
 ### Training Tips
 
