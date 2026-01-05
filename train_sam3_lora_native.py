@@ -813,10 +813,13 @@ class SAM3TrainerNative:
                 self.model,
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
-                find_unused_parameters=True  # Required for LoRA since not all params are used
+                find_unused_parameters=False  # Frozen params (requires_grad=False) don't need this flag
             )
             print_rank0(f"Model wrapped with DistributedDataParallel")
-        
+
+        # Store reference to unwrapped model for accessing custom methods
+        self._unwrapped_model = self.model.module if self.multi_gpu else self.model
+
         # Optimizer
         self.optimizer = AdamW(
             [p for p in self.model.parameters() if p.requires_grad],
@@ -1017,7 +1020,7 @@ class SAM3TrainerNative:
 
                 # Prepare targets for loss
                 # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
-                find_targets = [self.model.back_convert(target) for target in input_batch.find_targets]
+                find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
 
                 # Move targets to device
                 for targets in find_targets:
@@ -1077,7 +1080,7 @@ class SAM3TrainerNative:
                         outputs_list = self.model(input_batch)
 
                         # Prepare targets
-                        find_targets = [self.model.back_convert(target) for target in input_batch.find_targets]
+                        find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
 
                         # Move targets to device
                         for targets in find_targets:
