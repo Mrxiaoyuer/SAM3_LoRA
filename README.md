@@ -700,13 +700,13 @@ python3 infer_sam.py \
   --nms-iou 0.3 \
   --output clean_detections.png
 
-# Mask-only visualization (no boxes)
+# With bounding boxes
 python3 infer_sam.py \
   --config configs/full_lora_config.yaml \
   --image path/to/image.jpg \
   --prompt "crack" \
-  --no-boxes \
-  --output masks_only.png
+  --boundingbox True \
+  --output with_boxes.png
 ```
 
 ### NMS (Non-Maximum Suppression)
@@ -770,7 +770,7 @@ Text prompts help guide the model to segment specific objects more accurately. *
 | `--threshold` | Confidence threshold (0.0-1.0) | `0.3` | `0.5` |
 | `--nms-iou` | NMS IoU threshold (lower = fewer boxes) | `0.3` | `0.5` |
 | `--resolution` | Input resolution | `1008` | `1008` |
-| `--no-boxes` | Don't show bounding boxes | - | False |
+| `--boundingbox` | Show bounding boxes (True/False) | `True` | `False` |
 | `--no-masks` | Don't show segmentation masks | - | False |
 
 ### Python API

@@ -486,10 +486,10 @@ def main():
         help="Input resolution (default: 1008)"
     )
     parser.add_argument(
-        "--show-boxes",
-        action="store_true",
+        "--boundingbox",
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
         default=False,
-        help="Show bounding boxes (default: off)"
+        help="Show bounding boxes: True or False (default: False)"
     )
     parser.add_argument(
         "--no-masks",
@@ -521,7 +521,7 @@ def main():
     inferencer.visualize(
         results,
         args.output,
-        show_boxes=args.show_boxes,
+        show_boxes=args.boundingbox,
         show_masks=not args.no_masks
     )
 
