@@ -62,8 +62,8 @@ lora:
 
 # Training settings
 training:
-  data_dir: "/workspace/data"  # Root directory containing train/valid/test folders with COCO annotations
-  batch_size: 4      # Increased from 1 to reduce gradient variance
+  data_dir: "data"  # Root directory containing train/valid/test folders with COCO annotations
+  batch_size: 1      # Dense masks/objects can OOM at larger batch sizes
   num_workers: 2        # Increase for better data loading
 
   learning_rate: 5e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
@@ -84,7 +84,7 @@ training:
 
   mixed_precision: "bf16"    # Use bfloat16 if available
   seed: 42
-  gradient_accumulation_steps: 8  # Reduced from 16 (effective batch: 2×8=16)
+  gradient_accumulation_steps: 32  # Keeps effective batch size ~32 with batch_size=1
 
 output:
   output_dir: "outputs/sam3_lora_full"
@@ -102,3 +102,32 @@ hardware:
   device: "cuda"
   dataloader_pin_memory: true
   use_compile: false
+
+
+
+  # "categories": [
+  #   {
+  #     "id": 1,
+  #     "name": "building with no damage"
+  #   },
+  #   {
+  #     "id": 2,
+  #     "name": "damaged building little"
+  #   },
+  #   {
+  #     "id": 3,
+  #     "name": "damaged building minor"
+  #   },
+  #   {
+  #     "id": 4,
+  #     "name": "damaged building medium"
+  #   },
+  #   {
+  #     "id": 5,
+  #     "name": "destroyed building"
+  #   },
+  #   {
+  #     "id": 6,
+  #     "name": "debris_cleared"
+  #   }
+  # ],

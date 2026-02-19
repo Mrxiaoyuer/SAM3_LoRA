@@ -27,11 +27,11 @@ lora:
   apply_to_geometry_encoder: false # Skip geometry encoder
   apply_to_detr_encoder: true      # Keep DETR encoder (core detection)
   apply_to_detr_decoder: true      # Keep DETR decoder (core detection)
-  apply_to_mask_decoder: true      # Keep mask decoder (final segmentation)
+  apply_to_mask_decoder: false      # Keep mask decoder (final segmentation)
 
 # Training settings
 training:
-  data_dir: "/workspace/data2"
+  data_dir: "data"
   batch_size: 2         # Larger than full config (fewer LoRA params)
   num_workers: 2
 

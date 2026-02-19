@@ -22,6 +22,8 @@ Multi-GPU Training:
 """
 
 import os
+# Reduce CUDA memory fragmentation on long training runs.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import argparse
 import yaml
 import json
@@ -1002,6 +1004,10 @@ class SAM3TrainerNative:
         out_dir = Path(self.config["output"]["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        grad_accum_steps = max(1, int(self.config["training"].get("gradient_accumulation_steps", 1)))
+        if grad_accum_steps > 1:
+            print_rank0(f"Gradient accumulation enabled: {grad_accum_steps} steps")
+
         for epoch in range(epochs):
             # Set epoch for distributed sampler (required for proper shuffling)
             if self.multi_gpu and train_sampler is not None:
@@ -1009,61 +1015,79 @@ class SAM3TrainerNative:
 
             # Track training losses for this epoch
             train_losses = []
+            self.optimizer.zero_grad(set_to_none=True)
 
             # Only show progress bar on rank 0
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
-            for batch_dict in pbar:
-                input_batch = batch_dict["input"]
+            for step_idx, batch_dict in enumerate(pbar, start=1):
+                try:
+                    input_batch = batch_dict["input"]
 
-                # Move to device
-                input_batch = move_to_device(input_batch, self.device)
+                    # Move to device
+                    input_batch = move_to_device(input_batch, self.device)
 
-                # Forward pass
-                # outputs_list is SAM3Output, we need to pass the whole thing to loss_wrapper
-                outputs_list = self.model(input_batch)
+                    # Forward pass
+                    # outputs_list is SAM3Output, we need to pass the whole thing to loss_wrapper
+                    outputs_list = self.model(input_batch)
 
-                # Prepare targets for loss
-                # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
-                find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+                    # Prepare targets for loss
+                    # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
+                    find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
 
-                # Move targets to device
-                for targets in find_targets:
-                    for k, v in targets.items():
-                        if isinstance(v, torch.Tensor):
-                            targets[k] = v.to(self.device)
+                    # Move targets to device
+                    for targets in find_targets:
+                        for k, v in targets.items():
+                            if isinstance(v, torch.Tensor):
+                                targets[k] = v.to(self.device)
 
-                # Add matcher indices to outputs (required by Sam3LossWrapper)
-                # Use SAM3Output.iteration_mode to properly iterate over outputs
-                with SAM3Output.iteration_mode(
-                    outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
-                ) as outputs_iter:
-                    for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
-                        # stage_targets is a single target dict, replicate for all steps
-                        stage_targets_list = [stage_targets] * len(stage_outputs)
-                        for outputs, targets in zip(stage_outputs, stage_targets_list):
-                            # Compute indices for main output
-                            outputs["indices"] = self.matcher(outputs, targets)
+                    # Add matcher indices to outputs (required by Sam3LossWrapper)
+                    # Use SAM3Output.iteration_mode to properly iterate over outputs
+                    with SAM3Output.iteration_mode(
+                        outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+                    ) as outputs_iter:
+                        for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
+                            # stage_targets is a single target dict, replicate for all steps
+                            stage_targets_list = [stage_targets] * len(stage_outputs)
+                            for outputs, targets in zip(stage_outputs, stage_targets_list):
+                                # Compute indices for main output
+                                outputs["indices"] = self.matcher(outputs, targets)
 
-                            # Also add indices to auxiliary outputs if they exist
-                            if "aux_outputs" in outputs:
-                                for aux_out in outputs["aux_outputs"]:
-                                    aux_out["indices"] = self.matcher(aux_out, targets)
+                                # Also add indices to auxiliary outputs if they exist
+                                if "aux_outputs" in outputs:
+                                    for aux_out in outputs["aux_outputs"]:
+                                        aux_out["indices"] = self.matcher(aux_out, targets)
 
-                # Compute loss using Sam3LossWrapper
-                # This handles num_boxes calculation and proper weighting
-                loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                    # Compute loss using Sam3LossWrapper
+                    # This handles num_boxes calculation and proper weighting
+                    loss_dict = self.loss_wrapper(outputs_list, find_targets)
 
-                # Extract total loss
-                total_loss = loss_dict[CORE_LOSS_KEY]
+                    # Extract total loss
+                    total_loss = loss_dict[CORE_LOSS_KEY]
 
-                # Backward
-                self.optimizer.zero_grad()
-                total_loss.backward()
-                self.optimizer.step()
+                    # Backward (with gradient accumulation)
+                    (total_loss / grad_accum_steps).backward()
 
-                # Track training loss
-                train_losses.append(total_loss.item())
-                pbar.set_postfix({"loss": total_loss.item()})
+                    should_step = (step_idx % grad_accum_steps == 0) or (step_idx == len(train_loader))
+                    if should_step:
+                        self.optimizer.step()
+                        self.optimizer.zero_grad(set_to_none=True)
+
+                    # Track training loss
+                    train_losses.append(total_loss.item())
+                    pbar.set_postfix({"loss": total_loss.item()})
+                except RuntimeError as e:
+                    err_msg = str(e).lower()
+                    recoverable = ("out of memory" in err_msg) or ("cudnn_status_internal_error" in err_msg)
+                    if recoverable and not self.multi_gpu:
+                        print_rank0(
+                            f"\n⚠️ CUDA failure at epoch {epoch+1} step {step_idx}. "
+                            f"Skipping batch and clearing cache. Error: {e}"
+                        )
+                        self.optimizer.zero_grad(set_to_none=True)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+                    raise
 
             # Calculate average training loss for this epoch
             avg_train_loss = sum(train_losses) / len(train_losses) if train_losses else 0.0
