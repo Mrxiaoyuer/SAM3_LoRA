@@ -37,8 +37,8 @@ class LoRAConfig:
 
         # Default: apply to all attention projections and FFN layers
         # Supports multiple naming conventions:
-        # - q_proj, k_proj, v_proj, out_proj: Standard separate projections
-        # - qkv: Fused Q/K/V projection (ViT-style, used in SAM3 vision backbone)
+        # - q_proj, k_proj, v_proj: legacy names mapped to packed "qkv" in MHA
+        # - qkv: Fused Q/K/V projection (ViT-style and packed MHA replacement)
         # - proj: Output projection in vision backbone
         # - c_fc, c_proj: MLP layers in CLIP-style language backbone
         # - linear1, linear2: FFN layers in transformer encoder/decoder
@@ -90,6 +90,14 @@ def _should_inject_lora(name: str, target_modules: Set[str]) -> bool:
     # Get the module basename (last part of the name)
     module_basename = name.split(".")[-1]
 
+    # Backward-compatibility mapping:
+    # packed MHA projection is named "qkv", but configs may still list q/k/v.
+    if module_basename == "qkv":
+        if "qkv" in target_modules:
+            return True
+        if {"q_proj", "k_proj", "v_proj"} & target_modules:
+            return True
+
     # Direct basename match - most reliable method
     if module_basename in target_modules:
         return True
@@ -140,7 +148,7 @@ def inject_lora_into_model(
     Inject LoRA layers into a SAM3 model.
 
     This function:
-    1. Replaces nn.MultiheadAttention with MultiheadAttentionLoRA (enables LoRA on Q/K/V/out_proj)
+    1. Replaces nn.MultiheadAttention with MultiheadAttentionLoRA (packed qkv + out_proj)
     2. Applies LoRA to all matching Linear layers
 
     Args:
