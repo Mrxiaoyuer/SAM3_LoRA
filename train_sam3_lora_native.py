@@ -1060,6 +1060,18 @@ class SAM3TrainerNative:
         if grad_accum_steps > 1:
             print_rank0(f"Gradient accumulation enabled: {grad_accum_steps} steps")
 
+        def is_recoverable_training_error(exc: BaseException) -> bool:
+            """Errors that are safe to skip before backward/all-reduce."""
+            err_msg = str(exc).lower()
+            if isinstance(exc, OverflowError):
+                return True
+            return (
+                ("out of memory" in err_msg)
+                or ("cudnn_status_internal_error" in err_msg)
+                or ("signed integer is greater than maximum" in err_msg)
+                or ("triton" in err_msg and "overflow" in err_msg)
+            )
+
         for epoch in range(epochs):
             # Set epoch for distributed sampler (required for proper shuffling)
             if self.multi_gpu and train_sampler is not None:
@@ -1124,10 +1136,8 @@ class SAM3TrainerNative:
 
                         # Extract total loss
                         total_loss = loss_dict[CORE_LOSS_KEY]
-                except RuntimeError as e:
-                    err_msg = str(e).lower()
-                    recoverable = ("out of memory" in err_msg) or ("cudnn_status_internal_error" in err_msg)
-                    if recoverable:
+                except (RuntimeError, OverflowError) as e:
+                    if is_recoverable_training_error(e):
                         local_recoverable_error = str(e)
                     else:
                         raise
@@ -1144,12 +1154,12 @@ class SAM3TrainerNative:
                 if should_skip_batch:
                     if local_recoverable_error is not None:
                         print(
-                            f"[rank {get_rank()}] ⚠️ CUDA failure at epoch {epoch+1} step {step_idx}. "
+                            f"[rank {get_rank()}] ⚠️ Recoverable failure at epoch {epoch+1} step {step_idx}. "
                             f"Skipping batch and clearing cache. Error: {local_recoverable_error}"
                         )
                     elif self.multi_gpu and is_main_process():
                         print_rank0(
-                            f"\n⚠️ Skipping epoch {epoch+1} step {step_idx} because another rank hit a CUDA failure."
+                            f"\n⚠️ Skipping epoch {epoch+1} step {step_idx} because another rank hit a recoverable failure."
                         )
                     self.optimizer.zero_grad(set_to_none=True)
                     if torch.cuda.is_available():
@@ -1170,12 +1180,11 @@ class SAM3TrainerNative:
                             self.grad_scaler.scale(scaled_loss).backward()
                         else:
                             scaled_loss.backward()
-                except RuntimeError as e:
-                    err_msg = str(e).lower()
-                    recoverable = ("out of memory" in err_msg) or ("cudnn_status_internal_error" in err_msg)
+                except (RuntimeError, OverflowError) as e:
+                    recoverable = is_recoverable_training_error(e)
                     if recoverable and not self.multi_gpu:
                         print_rank0(
-                            f"\n⚠️ CUDA failure at epoch {epoch+1} step {step_idx} during backward. "
+                            f"\n⚠️ Recoverable failure at epoch {epoch+1} step {step_idx} during backward. "
                             f"Skipping batch and clearing cache. Error: {e}"
                         )
                         self.optimizer.zero_grad(set_to_none=True)
