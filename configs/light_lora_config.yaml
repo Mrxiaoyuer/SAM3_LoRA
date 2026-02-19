@@ -70,5 +70,10 @@ evaluation:
 
 hardware:
   device: "cuda"
+  use_compile: true
+  cudnn_benchmark: true
+  allow_tf32: true
+  use_fused_adamw: true
   dataloader_pin_memory: true
-  use_compile: false
+  persistent_workers: true
+  prefetch_factor: 2

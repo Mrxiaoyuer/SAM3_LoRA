@@ -768,6 +768,8 @@ class SAM3TrainerNative:
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
 
+        hw_cfg = self.config.get("hardware", {})
+
         # Multi-GPU setup
         self.multi_gpu = multi_gpu
         self.local_rank = 0
@@ -781,15 +783,31 @@ class SAM3TrainerNative:
         else:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # CUDA performance flags
+        if self.device.type == "cuda":
+            cudnn_benchmark = bool(hw_cfg.get("cudnn_benchmark", True))
+            allow_tf32 = bool(hw_cfg.get("allow_tf32", True))
+            torch.backends.cudnn.benchmark = cudnn_benchmark
+            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+            torch.backends.cudnn.allow_tf32 = allow_tf32
+            if hasattr(torch, "set_float32_matmul_precision"):
+                torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
+            print_rank0(
+                f"CUDA perf flags: cudnn.benchmark={cudnn_benchmark}, "
+                f"allow_tf32={allow_tf32}"
+            )
+
         # Build Model
         print_rank0("Building SAM3 model...")
+        use_compile = bool(hw_cfg.get("use_compile", False))
         self.model = build_sam3_image_model(
             device=self.device.type,
-            compile=False,
+            compile=use_compile,
             load_from_HF=True,  # Tries to download from HF if checkpoint_path is None
             bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
             eval_mode=False
         )
+        print_rank0(f"torch.compile enabled: {use_compile}")
 
         # Apply LoRA
         print_rank0("Applying LoRA...")
@@ -827,11 +845,33 @@ class SAM3TrainerNative:
         self._unwrapped_model = self.model.module if self.multi_gpu else self.model
 
         # Optimizer
-        self.optimizer = AdamW(
-            [p for p in self.model.parameters() if p.requires_grad],
-            lr=float(self.config["training"]["learning_rate"]),
-            weight_decay=self.config["training"]["weight_decay"]
-        )
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        lr = float(self.config["training"]["learning_rate"])
+        weight_decay = self.config["training"]["weight_decay"]
+        use_fused_adamw = bool(hw_cfg.get("use_fused_adamw", True))
+
+        if use_fused_adamw and self.device.type == "cuda":
+            try:
+                self.optimizer = AdamW(
+                    trainable_params,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    fused=True,
+                )
+                print_rank0("Optimizer: AdamW(fused=True)")
+            except Exception as e:
+                print_rank0(f"⚠️ fused AdamW unavailable ({e}); falling back to standard AdamW.")
+                self.optimizer = AdamW(
+                    trainable_params,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                )
+        else:
+            self.optimizer = AdamW(
+                trainable_params,
+                lr=lr,
+                weight_decay=weight_decay,
+            )
 
         # Mixed precision setup (supports: no, fp16, bf16)
         mixed_precision = str(self.config.get("training", {}).get("mixed_precision", "no")).strip().lower()
@@ -969,6 +1009,22 @@ class SAM3TrainerNative:
         def collate_fn(batch):
             return collate_fn_api(batch, dict_key="input", with_seg_masks=True)
 
+        num_workers = int(self.config["training"].get("num_workers", 0))
+        pin_memory = bool(self.config.get("hardware", {}).get("dataloader_pin_memory", True))
+        persistent_workers = bool(self.config.get("hardware", {}).get("persistent_workers", True))
+        prefetch_cfg = self.config.get("hardware", {}).get("prefetch_factor", 2)
+        prefetch_factor = int(prefetch_cfg) if prefetch_cfg is not None else 2
+        transfer_non_blocking = bool(self.device.type == "cuda" and pin_memory)
+
+        loader_common_kwargs = {
+            "collate_fn": collate_fn,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+        }
+        if num_workers > 0:
+            loader_common_kwargs["persistent_workers"] = persistent_workers
+            loader_common_kwargs["prefetch_factor"] = prefetch_factor
+
         # Create samplers for distributed training
         train_sampler = None
         val_sampler = None
@@ -993,9 +1049,7 @@ class SAM3TrainerNative:
             batch_size=self.config["training"]["batch_size"],
             shuffle=(train_sampler is None),  # Only shuffle if not using sampler
             sampler=train_sampler,
-            collate_fn=collate_fn,
-            num_workers=self.config["training"].get("num_workers", 0),
-            pin_memory=True
+            **loader_common_kwargs,
         )
 
         if has_validation:
@@ -1004,9 +1058,7 @@ class SAM3TrainerNative:
                 batch_size=self.config["training"]["batch_size"],
                 shuffle=False,
                 sampler=val_sampler,
-                collate_fn=collate_fn,
-                num_workers=self.config["training"].get("num_workers", 0),
-                pin_memory=True
+                **loader_common_kwargs,
             )
         else:
             val_loader = None
@@ -1038,7 +1090,7 @@ class SAM3TrainerNative:
         # Helper to move BatchedDatapoint to device
         def move_to_device(obj, device):
             if isinstance(obj, torch.Tensor):
-                return obj.to(device)
+                return obj.to(device, non_blocking=transfer_non_blocking)
             elif isinstance(obj, list):
                 return [move_to_device(x, device) for x in obj]
             elif isinstance(obj, tuple):
@@ -1110,7 +1162,7 @@ class SAM3TrainerNative:
                     for targets in find_targets:
                         for k, v in targets.items():
                             if isinstance(v, torch.Tensor):
-                                targets[k] = v.to(self.device)
+                                targets[k] = v.to(self.device, non_blocking=transfer_non_blocking)
 
                     # Add matcher indices to outputs (required by Sam3LossWrapper)
                     # Use SAM3Output.iteration_mode to properly iterate over outputs
@@ -1238,7 +1290,7 @@ class SAM3TrainerNative:
                         for targets in find_targets:
                             for k, v in targets.items():
                                 if isinstance(v, torch.Tensor):
-                                    targets[k] = v.to(self.device)
+                                    targets[k] = v.to(self.device, non_blocking=transfer_non_blocking)
 
                         # Add matcher indices to outputs (required by Sam3LossWrapper)
                         with SAM3Output.iteration_mode(
