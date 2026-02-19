@@ -1020,6 +1020,13 @@ class SAM3TrainerNative:
             # Only show progress bar on rank 0
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
             for step_idx, batch_dict in enumerate(pbar, start=1):
+                input_batch = None
+                outputs_list = None
+                find_targets = None
+                loss_dict = None
+                total_loss = None
+                local_recoverable_error = None
+
                 try:
                     input_batch = batch_dict["input"]
 
@@ -1063,31 +1070,76 @@ class SAM3TrainerNative:
 
                     # Extract total loss
                     total_loss = loss_dict[CORE_LOSS_KEY]
+                except RuntimeError as e:
+                    err_msg = str(e).lower()
+                    recoverable = ("out of memory" in err_msg) or ("cudnn_status_internal_error" in err_msg)
+                    if recoverable:
+                        local_recoverable_error = str(e)
+                    else:
+                        raise
 
-                    # Backward (with gradient accumulation)
-                    (total_loss / grad_accum_steps).backward()
+                # In DDP, all ranks must agree to skip a batch if any rank failed in forward/loss.
+                should_skip_batch = local_recoverable_error is not None
+                if self.multi_gpu:
+                    skip_tensor = torch.tensor(
+                        [1 if should_skip_batch else 0], device=self.device, dtype=torch.int32
+                    )
+                    dist.all_reduce(skip_tensor, op=dist.ReduceOp.MAX)
+                    should_skip_batch = bool(skip_tensor.item())
 
-                    should_step = (step_idx % grad_accum_steps == 0) or (step_idx == len(train_loader))
-                    if should_step:
-                        self.optimizer.step()
-                        self.optimizer.zero_grad(set_to_none=True)
+                if should_skip_batch:
+                    if local_recoverable_error is not None:
+                        print(
+                            f"[rank {get_rank()}] ⚠️ CUDA failure at epoch {epoch+1} step {step_idx}. "
+                            f"Skipping batch and clearing cache. Error: {local_recoverable_error}"
+                        )
+                    elif self.multi_gpu and is_main_process():
+                        print_rank0(
+                            f"\n⚠️ Skipping epoch {epoch+1} step {step_idx} because another rank hit a CUDA failure."
+                        )
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
 
-                    # Track training loss
-                    train_losses.append(total_loss.item())
-                    pbar.set_postfix({"loss": total_loss.item()})
+                should_step = (step_idx % grad_accum_steps == 0) or (step_idx == len(train_loader))
+                sync_context = contextlib.nullcontext()
+                if self.multi_gpu and not should_step:
+                    # Avoid all-reduce on intermediate accumulation steps.
+                    sync_context = self.model.no_sync()
+
+                try:
+                    with sync_context:
+                        # Backward (with gradient accumulation)
+                        (total_loss / grad_accum_steps).backward()
                 except RuntimeError as e:
                     err_msg = str(e).lower()
                     recoverable = ("out of memory" in err_msg) or ("cudnn_status_internal_error" in err_msg)
                     if recoverable and not self.multi_gpu:
                         print_rank0(
-                            f"\n⚠️ CUDA failure at epoch {epoch+1} step {step_idx}. "
+                            f"\n⚠️ CUDA failure at epoch {epoch+1} step {step_idx} during backward. "
                             f"Skipping batch and clearing cache. Error: {e}"
                         )
                         self.optimizer.zero_grad(set_to_none=True)
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                         continue
+                    if recoverable and self.multi_gpu:
+                        raise RuntimeError(
+                            f"CUDA failure during backward on rank {get_rank()} at epoch {epoch+1}, "
+                            f"step {step_idx}. DDP cannot safely skip once backward starts; "
+                            f"reduce memory pressure (batch size / LoRA scope / input resolution) and relaunch."
+                        ) from e
                     raise
+
+                if should_step:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
+
+                # Track training loss
+                loss_value = total_loss.item()
+                train_losses.append(loss_value)
+                pbar.set_postfix({"loss": loss_value})
 
             # Calculate average training loss for this epoch
             avg_train_loss = sum(train_losses) / len(train_losses) if train_losses else 0.0
