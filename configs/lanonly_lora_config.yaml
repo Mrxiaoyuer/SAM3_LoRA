@@ -1,0 +1,74 @@
+# SAM3 LoRA Training Configuration
+# Minimal LoRA configuration - applies LoRA only to decoder components
+# Use this for efficient fine-tuning with minimal trainable parameters
+
+# Model settings
+model:
+  name: "facebook/sam3"
+  cache_dir: null
+
+# LoRA settings
+lora:
+  rank: 16                    # Low rank for efficiency
+  alpha: 32                   # 2x rank
+  dropout: 0.1
+
+  # Target only attention projections (not MLP)
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    # Language backbone (CLIP-style)
+    - "c_fc"                 # Language backbone MLP first layer
+    - "c_proj"               # Language backbone MLP second layer
+  
+  # Apply LoRA ONLY to decoder components (keep encoders frozen)
+  apply_to_vision_encoder: false   # Keep vision encoder frozen
+  apply_to_text_encoder: true     # Keep text encoder frozen
+  apply_to_geometry_encoder: false # Keep geometry encoder frozen
+  apply_to_detr_encoder: false     # Keep DETR encoder frozen
+  apply_to_detr_decoder: false      # Only adapt DETR decoder
+  apply_to_mask_decoder: false     # Keep mask decoder frozen
+
+# Training settings
+training:
+  data_dir: "data"  # Root directory containing train/valid/test folders with COCO annotations
+  batch_size: 8      # Dense masks/objects can OOM at larger batch sizes
+  num_workers: 8        # Increase for better data loading
+
+  learning_rate: 1e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1e-8
+  max_grad_norm: 1.0
+
+  num_epochs: 100       # Reduced from 500 (small dataset overfits quickly)
+  warmup_steps: 200     # Reduced from 1000 (proportional to dataset size)
+  lr_scheduler: "cosine"
+
+  logging_steps: 10
+  eval_steps: 100       # More frequent validation (from 500)
+  save_steps: 100       # More frequent checkpoints (from 1000)
+  save_total_limit: 5   # Keep more checkpoints
+
+  mixed_precision: "fp16"    # Use bfloat16 if available
+  seed: 42
+  gradient_accumulation_steps: 2  # Keeps effective batch size ~32 with batch_size=1
+
+output:
+  output_dir: "outputs/sam3_lora_lanonly"
+  logging_dir: "logs"
+  save_lora_only: true
+  push_to_hub: false
+  hub_model_id: null
+
+evaluation:
+  metric: "iou"
+  save_predictions: false
+  compute_metrics_during_training: true
+
+hardware:
+  device: "cuda"
+  dataloader_pin_memory: true
+  use_compile: false

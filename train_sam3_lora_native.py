@@ -832,7 +832,54 @@ class SAM3TrainerNative:
             lr=float(self.config["training"]["learning_rate"]),
             weight_decay=self.config["training"]["weight_decay"]
         )
-        
+
+        # Mixed precision setup (supports: no, fp16, bf16)
+        mixed_precision = str(self.config.get("training", {}).get("mixed_precision", "no")).strip().lower()
+        alias_map = {
+            "none": "no",
+            "off": "no",
+            "false": "no",
+            "0": "no",
+            "float16": "fp16",
+            "half": "fp16",
+            "bfloat16": "bf16",
+        }
+        mixed_precision = alias_map.get(mixed_precision, mixed_precision)
+        self.mixed_precision = mixed_precision
+        self.amp_enabled = False
+        self.amp_dtype = None
+
+        if mixed_precision == "fp16":
+            if self.device.type == "cuda":
+                self.amp_enabled = True
+                self.amp_dtype = torch.float16
+            else:
+                print_rank0("⚠️ mixed_precision=fp16 requested but CUDA is unavailable; disabling mixed precision.")
+        elif mixed_precision == "bf16":
+            if self.device.type != "cuda":
+                print_rank0("⚠️ mixed_precision=bf16 requested but CUDA is unavailable; disabling mixed precision.")
+            elif hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+                self.amp_enabled = True
+                self.amp_dtype = torch.bfloat16
+            else:
+                print_rank0("⚠️ mixed_precision=bf16 requested but GPU does not support bf16; falling back to fp16.")
+                self.amp_enabled = True
+                self.amp_dtype = torch.float16
+        elif mixed_precision != "no":
+            print_rank0(
+                f"⚠️ Unknown mixed_precision mode '{mixed_precision}'. "
+                "Expected one of: no, fp16, bf16. Disabling mixed precision."
+            )
+
+        self.use_grad_scaler = self.amp_enabled and self.amp_dtype == torch.float16
+        self.grad_scaler = torch.cuda.amp.GradScaler(enabled=self.use_grad_scaler)
+
+        if self.amp_enabled:
+            amp_mode = "bf16" if self.amp_dtype == torch.bfloat16 else "fp16"
+            print_rank0(f"Mixed precision enabled: {amp_mode}")
+        else:
+            print_rank0("Mixed precision disabled")
+
         # Matcher & Loss
         self.matcher = BinaryHungarianMatcherV2(
             cost_class=2.0, cost_bbox=5.0, cost_giou=2.0, focal=True
@@ -885,7 +932,12 @@ class SAM3TrainerNative:
             normalization="local",  # Use local normalization (no distributed training)
             normalize_by_valid_object_num=False,
         )
-        
+
+    def _autocast_context(self):
+        if not self.amp_enabled:
+            return contextlib.nullcontext()
+        return torch.autocast(device_type=self.device.type, dtype=self.amp_dtype)
+
     def train(self):
         # Get data directory from config (should point to directory containing train/valid folders)
         data_dir = self.config["training"]["data_dir"]
@@ -1035,7 +1087,8 @@ class SAM3TrainerNative:
 
                     # Forward pass
                     # outputs_list is SAM3Output, we need to pass the whole thing to loss_wrapper
-                    outputs_list = self.model(input_batch)
+                    with self._autocast_context():
+                        outputs_list = self.model(input_batch)
 
                     # Prepare targets for loss
                     # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
@@ -1066,10 +1119,11 @@ class SAM3TrainerNative:
 
                     # Compute loss using Sam3LossWrapper
                     # This handles num_boxes calculation and proper weighting
-                    loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                    with self._autocast_context():
+                        loss_dict = self.loss_wrapper(outputs_list, find_targets)
 
-                    # Extract total loss
-                    total_loss = loss_dict[CORE_LOSS_KEY]
+                        # Extract total loss
+                        total_loss = loss_dict[CORE_LOSS_KEY]
                 except RuntimeError as e:
                     err_msg = str(e).lower()
                     recoverable = ("out of memory" in err_msg) or ("cudnn_status_internal_error" in err_msg)
@@ -1111,7 +1165,11 @@ class SAM3TrainerNative:
                 try:
                     with sync_context:
                         # Backward (with gradient accumulation)
-                        (total_loss / grad_accum_steps).backward()
+                        scaled_loss = total_loss / grad_accum_steps
+                        if self.use_grad_scaler:
+                            self.grad_scaler.scale(scaled_loss).backward()
+                        else:
+                            scaled_loss.backward()
                 except RuntimeError as e:
                     err_msg = str(e).lower()
                     recoverable = ("out of memory" in err_msg) or ("cudnn_status_internal_error" in err_msg)
@@ -1133,7 +1191,11 @@ class SAM3TrainerNative:
                     raise
 
                 if should_step:
-                    self.optimizer.step()
+                    if self.use_grad_scaler:
+                        self.grad_scaler.step(self.optimizer)
+                        self.grad_scaler.update()
+                    else:
+                        self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
 
                 # Track training loss
@@ -1157,7 +1219,8 @@ class SAM3TrainerNative:
                         input_batch = move_to_device(input_batch, self.device)
 
                         # Forward pass
-                        outputs_list = self.model(input_batch)
+                        with self._autocast_context():
+                            outputs_list = self.model(input_batch)
 
                         # Prepare targets
                         find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
@@ -1181,8 +1244,9 @@ class SAM3TrainerNative:
                                             aux_out["indices"] = self.matcher(aux_out, targets)
 
                         # Compute loss using Sam3LossWrapper
-                        loss_dict = self.loss_wrapper(outputs_list, find_targets)
-                        total_loss = loss_dict[CORE_LOSS_KEY]
+                        with self._autocast_context():
+                            loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                            total_loss = loss_dict[CORE_LOSS_KEY]
 
                         val_losses.append(total_loss.item())
                         val_pbar.set_postfix({"val_loss": total_loss.item()})
